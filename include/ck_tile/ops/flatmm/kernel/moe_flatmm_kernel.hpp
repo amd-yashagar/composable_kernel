@@ -16,6 +16,10 @@
 #endif
 // #define disable_tile_gs
 
+// Defined when the weight-scale K stride and pack count use the padded K layout (see
+// scale_b_flat_view), so K that is a multiple of 128 but not of 256 indexes scales correctly.
+#define CK_TILE_MOE_FLATMM_PADDED_SCALE_K 1
+
 namespace ck_tile {
 
 template <class ScaleM     = FlatmmScalePointer<-1>,
@@ -708,7 +712,8 @@ struct MoeFlatmmKernel
                 constexpr int MThreadPerXdl = BlockGemmShape::WarpTile::at(I0);
                 constexpr int KThreadPerXdl = 64 / BlockGemmShape::WarpTile::at(I0);
                 index_t scale_m_packs       = kargs.M / (MXFP4M_Pack * MThreadPerXdl);
-                index_t scale_k_packs = kargs.K / (MXFP4K_Pack * AGranularityK * KThreadPerXdl);
+                index_t scale_k_packs = (kargs.K + MXFP4K_Pack * AGranularityK * KThreadPerXdl - 1) /
+                                        (MXFP4K_Pack * AGranularityK * KThreadPerXdl);
                 // Pack 2x2 e8m0 over M/K dimension into 1 int32_t to trigger dword width load
                 const auto scale_a_naive_desc = make_naive_tensor_descriptor_packed(
                     make_tuple(scale_m_packs, scale_k_packs, KThreadPerXdl, MThreadPerXdl));
@@ -727,7 +732,8 @@ struct MoeFlatmmKernel
                 constexpr int MThreadPerXdl = BlockGemmShape::WarpTile::at(I0);
                 constexpr int KThreadPerXdl = 64 / BlockGemmShape::WarpTile::at(I0);
                 index_t scale_m_packs       = kargs.M / (MXFP4M_Pack * MThreadPerXdl);
-                index_t scale_k_packs = kargs.K / (MXFP4K_Pack * AGranularityK * KThreadPerXdl);
+                index_t scale_k_packs = (kargs.K + MXFP4K_Pack * AGranularityK * KThreadPerXdl - 1) /
+                                        (MXFP4K_Pack * AGranularityK * KThreadPerXdl);
                 return make_naive_tensor_view<address_space_enum::global>(
                     reinterpret_cast<const int32_t*>(scale_m_desc.ptr),
                     make_tuple(scale_m_packs * MThreadPerXdl, scale_k_packs * KThreadPerXdl),
@@ -743,12 +749,14 @@ struct MoeFlatmmKernel
                 decltype(scale_n)::GranularityK == 0 ? 1 : decltype(scale_n)::GranularityK;
             if constexpr(AQUANT_Pipeline)
             {
-                index_t scale_k =
-                    BGranularityK == 0 ? 1 : (kargs.K + BGranularityK - 1) / BGranularityK;
                 constexpr int NThreadPerXdl = BlockGemmShape::WarpTile::at(I1);
                 constexpr int KThreadPerXdl = 64 / BlockGemmShape::WarpTile::at(I1);
-                index_t scale_n_packs       = kargs.N / (MXFP4N_Pack * NThreadPerXdl);
-                index_t scale_k_packs = kargs.K / (MXFP4K_Pack * BGranularityK * KThreadPerXdl);
+                // The weight scale is stored with its K groups padded to whole packs of
+                // MXFP4K_Pack * KThreadPerXdl groups (8, i.e. K to 256), per expert.
+                index_t scale_k_packs = (kargs.K + MXFP4K_Pack * BGranularityK * KThreadPerXdl - 1) /
+                                        (MXFP4K_Pack * BGranularityK * KThreadPerXdl);
+                index_t scale_k       = scale_k_packs * MXFP4K_Pack * KThreadPerXdl;
+                index_t scale_n_packs = kargs.N / (MXFP4N_Pack * NThreadPerXdl);
                 const auto scale_b_navie_desc = make_naive_tensor_descriptor_packed(
                     make_tuple(scale_n_packs, scale_k_packs, KThreadPerXdl, NThreadPerXdl));
                 const auto scale_b_desc = transform_tensor_descriptor(
@@ -767,6 +775,12 @@ struct MoeFlatmmKernel
             {
                 index_t scale_k =
                     BGranularityK == 0 ? 1 : (kargs.K + BGranularityK - 1) / BGranularityK;
+                if constexpr(BMXFP4_Pipeline)
+                {
+                    // Padded K groups per expert, as in the AQUANT branch above.
+                    constexpr int ScaleKAlign = K_Pack * (64 / BlockGemmShape::WarpTile::at(I1));
+                    scale_k = (scale_k + ScaleKAlign - 1) / ScaleKAlign * ScaleKAlign;
+                }
                 const auto scale_k_offset =
                     (splitk_batch_offset.b_k_split_offset / BGranularityK) * K_Pack;
                 index_t FlatScaleK = scale_k * N_Pack * BlockGemmShape::WarpTile::at(I1);
